@@ -12,86 +12,200 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import logging
 import os
 import queue
-import time
+import threading
+import termios
+
+from typing import Optional, Tuple, Any
 
 from serial.tools.miniterm import Console
 
 from .console_parser import ConsoleParser
-from .constants import CMD_STOP, TAG_CMD
+from .constants import CMD_STOP, TAG_CMD, CTRL_RBRACKET, CTRL_C
 from .stoppable_thread import StoppableThread
+
+logger = logging.getLogger(__name__)
 
 
 class ConsoleReader(StoppableThread):
-    """ Read input keys from the console and push them to the queue,
-    until stopped.
+    """
+    Read input keys from the console and push them to the queue, until stopped.
+
+    Handles:
+    - Regular character input processing
+    - Control characters (Ctrl+C, Ctrl+])
+    - Keyboard interrupts
+    - Cross-platform input buffer flushing - necessary because the console is borrowed from the miniterm module
+    - Graceful cleanup on exit
     """
 
-    def __init__(self, console, event_queue, cmd_queue, parser, test_mode):
-        # type: (Console, queue.Queue, queue.Queue, ConsoleParser, bool) -> None
-        super(ConsoleReader, self).__init__()
+    def __init__(
+        self,
+        console: Console,
+        event_queue: queue.Queue,
+        cmd_queue: queue.Queue,
+        parser: ConsoleParser,
+        test_mode: bool,
+    ) -> None:
+        """
+        Initialize the console reader.
+
+        Args:
+            console: Console instance for input/output
+            event_queue: Queue for event messages
+            cmd_queue: Queue for command messages
+            parser: Parser for console input
+            test_mode: For running in test mode
+        """
+        super().__init__()
         self.console = console
         self.event_queue = event_queue
         self.cmd_queue = cmd_queue
         self.parser = parser
         self.test_mode = test_mode
+        self.stop_event = threading.Event()
+        self.input_buffer = queue.Queue(maxsize=1000)
 
-    def run(self):
-        # type: () -> None
+    def __enter__(self) -> "ConsoleReader":
+        """Setup console when entering context."""
         self.console.setup()
-        try:
-            while self.alive:
-                try:
-                    if os.name == 'nt':
-                        # Windows kludge: because the console.cancel() method doesn't
-                        # seem to work to unblock getkey() on the Windows implementation.
-                        #
-                        # So we only call getkey() if we know there's a key waiting for us.
-                        import msvcrt
-                        while not msvcrt.kbhit() and self.alive:  # type: ignore
-                            time.sleep(0.1)
-                        if not self.alive:
-                            break
-                    elif self.test_mode:
-                        # In testing mode the stdin is connected to PTY but is not used for input anything. For PTY
-                        # the canceling by fcntl.ioctl isn't working and would hang in self.console.getkey().
-                        # Therefore, we avoid calling it.
-                        while self.alive:
-                            time.sleep(0.1)
-                        break
-                    c = self.console.getkey()
-                except KeyboardInterrupt:
-                    c = '\x03'
-                if c is not None:
-                    ret = self.parser.parse(c)
-                    if ret is not None:
-                        (tag, cmd) = ret
-                        # stop command should be executed last
-                        if tag == TAG_CMD and cmd != CMD_STOP:
-                            self.cmd_queue.put(ret)
-                        else:
-                            self.event_queue.put(ret)
+        return self
 
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Cleanup console when exiting context."""
+        self._flush_input()
+        self.console.cleanup()
+
+    def run(self) -> None:
+        """Main loop that reads and processes console input."""
+        self.console.setup()
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    c = self.console.getkey()
+                    self._handle_input(c)
+                except KeyboardInterrupt:
+                    self._handle_stop()
+                    break
+                except Exception as e:
+                    logger.error("Exception in console reader: %s", e)
+                    break
         finally:
+            self._flush_input()
             self.console.cleanup()
 
-    def _cancel(self):
-        # type: () -> None
-        if os.name == 'posix' and not self.test_mode:
-            # this is the way cancel() is implemented in pyserial 3.3 or newer,
-            # older pyserial (3.1+) has cancellation implemented via 'select',
-            # which does not work when console sends an escape sequence response
-            #
-            # even older pyserial (<3.1) does not have this method
-            #
-            # on Windows there is a different (also hacky) fix, applied above.
-            #
-            # note that TIOCSTI is not implemented in WSL / bash-on-Windows.
-            # TODO: introduce some workaround to make it work there.
-            #
-            # Note: This would throw exception in testing mode when the stdin is connected to PTY.
-            import fcntl
-            import termios
-            fcntl.ioctl(self.console.fd, termios.TIOCSTI, b'\0')
+    def _handle_input(self, char: Optional[str]) -> None:
+        """
+        Process a single character of input.
+
+        Args:
+            char: Input character to process
+        """
+        if char in (CTRL_C, CTRL_RBRACKET):
+            self._handle_stop()
+            return
+
+        if char is not None:
+            try:
+                self.input_buffer.put_nowait(char)
+                ret = self.parser.parse(char)
+                if ret is not None:
+                    self._handle_parser_result(ret)
+            except queue.Full:
+                logger.warning("Input buffer full, discarding input")
+                self._process_buffer()
+
+    def _handle_parser_result(self, result: Tuple[str, Any]) -> None:
+        """
+        Handle parser result and route to appropriate queue.
+
+        Args:
+            result: Tuple of (tag, command) from parser
+        """
+        tag, cmd = result
+        target_queue = (
+            self.cmd_queue if tag == TAG_CMD and cmd != CMD_STOP else self.event_queue
+        )
+        target_queue.put(result)
+
+    def _handle_stop(self) -> None:
+        """Handle stop event in a consistent way."""
+        self.event_queue.put((TAG_CMD, CMD_STOP))
+        self.stop_event.set()
+
+    def _flush_input(self) -> bool:
+        """
+        Flush pending console input.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if os.name == "posix":
+            return self._flush_posix()
+        elif os.name == "nt":
+            return self._flush_windows()
+        return False
+
+    def _flush_posix(self) -> bool:
+        """
+        Flush input buffer on POSIX systems.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if hasattr(self.console, "fd"):
+                fd = self.console.fd
+                if os.isatty(fd):
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                    return True
+        except Exception as e:
+            logger.warning("Failed to flush POSIX console: %s", e)
+        return False
+
+    def _flush_windows(self) -> bool:
+        """
+        Flush input buffer on Windows systems.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            import msvcrt
+
+            while msvcrt.kbhit():
+                msvcrt.getch()
+            return True
+        except Exception as e:
+            logger.warning("Failed to flush Windows console: %s", e)
+        return False
+
+    def _process_buffer(self) -> None:
+        """Process and clear input buffer."""
+        try:
+            while not self.input_buffer.empty():
+                self.input_buffer.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _cancel(self) -> None:
+        """
+        Cancel the console reader operation.
+        Ensures pending input is flushed before stopping.
+        """
+        if not self.stop_event.is_set():
+            self.stop_event.set()
+            if not self.test_mode:
+                if not self._flush_input():
+                    self._send_interrupt()
+
+    def _send_interrupt(self) -> None:
+        """Send interrupt signal to console."""
+        try:
+            if hasattr(self.console, "fd"):
+                os.write(self.console.fd, b"\x03")
+        except Exception as e:
+            logger.error("Failed to send interrupt: %s", e)
